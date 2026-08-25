@@ -60,6 +60,63 @@ EMBEDDED_CONFIG = {
     "EXTRA_ALLOWED_DOWNLOAD_HOSTS": "",
 }
 WHATSAPP_URL = os.getenv("WHATSAPP_URL", "https://whatsapp.com/channel/0029VbBdHQnKWEKtmxS7XZ09")
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    language_code TEXT,
+    phone TEXT,
+    country_code TEXT,
+    points INTEGER NOT NULL DEFAULT 0,
+    banned INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    last_active INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS points_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    delta INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    related_user_id INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS referrals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    referrer_id INTEGER NOT NULL,
+    referred_id INTEGER UNIQUE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at INTEGER NOT NULL,
+    rewarded_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS scans (
+    scan_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    raw_url TEXT NOT NULL,
+    extension_name TEXT,
+    version TEXT,
+    canonical_url TEXT,
+    final_url TEXT,
+    archive_sha256 TEXT,
+    source_path TEXT,
+    report_path TEXT,
+    ioc_path TEXT,
+    secrets_path TEXT,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS admin_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    target_id INTEGER,
+    reason TEXT,
+    created_at INTEGER NOT NULL
+);
+"""
+
+
 class StatsDB:
     """Turso-backed persistence layer using the official Python serverless driver."""
 
