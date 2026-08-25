@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import socket
-import sqlite3
 import tempfile
 import time
 import uuid
@@ -20,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urljoin, urlsplit
+
+from database import StatsDB
 
 import httpx
 import jsbeautifier
@@ -41,7 +42,24 @@ LOG = logging.getLogger("senzo_extension_bot")
 BRAND = "SENZO EXTENSION INSPECTOR"
 WATERMARK = "@Senzo268"
 BOT_USERNAME = "@SenzoExtension_Bot"
-WHATSAPP_URL = "https://whatsapp.com/channel/0029VbBdHQnKWEKtmxS7XZ09"
+# Railway-safe defaults. TELEGRAM_BOT_TOKEN is intentionally never embedded here.
+# Railway Variables override every non-secret default below.
+EMBEDDED_CONFIG = {
+    "ADMIN_USER_IDS": "8105949422",
+
+    "RESULT_ROOT": "./data/results",
+    "FORCE_JOIN_CHANNELS": "",  # Set: -1001234567890|https://t.me/+invite for a private Telegram channel.
+    "MAX_DOWNLOAD_BYTES": "52428800",
+    "MAX_UNCOMPRESSED_BYTES": "157286400",
+    "MAX_FILES": "2500",
+    "MAX_FILE_BYTES": "26214400",
+    "RATE_LIMIT_PER_HOUR": "8",
+    "PARALLEL_JOBS": "2",
+    "REQUEST_TIMEOUT_SECONDS": "30",
+    "LOG_LEVEL": "INFO",
+    "EXTRA_ALLOWED_DOWNLOAD_HOSTS": "",
+}
+WHATSAPP_URL = os.getenv("WHATSAPP_URL", "https://whatsapp.com/channel/0029VbBdHQnKWEKtmxS7XZ09")
 USER_AGENT = "SenzoExtensionBot/2.0 (+public-package-inspector)"
 DEFAULT_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 DEFAULT_MAX_UNCOMPRESSED_BYTES = 150 * 1024 * 1024
@@ -103,19 +121,19 @@ class Settings:
         if not token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
         self.token = token
-        self.db_path = Path(os.getenv("BOT_DB_PATH", "./data/senzo.sqlite3"))
-        self.result_root = Path(os.getenv("RESULT_ROOT", "./data/results"))
-        self.max_download_bytes = int(os.getenv("MAX_DOWNLOAD_BYTES", DEFAULT_MAX_DOWNLOAD_BYTES))
-        self.max_uncompressed_bytes = int(os.getenv("MAX_UNCOMPRESSED_BYTES", DEFAULT_MAX_UNCOMPRESSED_BYTES))
-        self.max_files = int(os.getenv("MAX_FILES", DEFAULT_MAX_FILES))
-        self.max_file_bytes = int(os.getenv("MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES))
-        self.rate_limit_per_hour = int(os.getenv("RATE_LIMIT_PER_HOUR", "8"))
-        self.parallel_jobs = int(os.getenv("PARALLEL_JOBS", "2"))
-        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
-        self.admin_ids = {int(v.strip()) for v in os.getenv("ADMIN_USER_IDS", "").split(",") if v.strip().isdigit()}
-        extra_hosts = {v.strip().lower() for v in os.getenv("EXTRA_ALLOWED_DOWNLOAD_HOSTS", "").split(",") if v.strip()}
+        get_setting = lambda key: os.getenv(key, EMBEDDED_CONFIG[key])
+        self.result_root = Path(get_setting("RESULT_ROOT"))
+        self.max_download_bytes = int(get_setting("MAX_DOWNLOAD_BYTES"))
+        self.max_uncompressed_bytes = int(get_setting("MAX_UNCOMPRESSED_BYTES"))
+        self.max_files = int(get_setting("MAX_FILES"))
+        self.max_file_bytes = int(get_setting("MAX_FILE_BYTES"))
+        self.rate_limit_per_hour = int(get_setting("RATE_LIMIT_PER_HOUR"))
+        self.parallel_jobs = int(get_setting("PARALLEL_JOBS"))
+        self.request_timeout = float(get_setting("REQUEST_TIMEOUT_SECONDS"))
+        self.admin_ids = {int(v.strip()) for v in get_setting("ADMIN_USER_IDS").split(",") if v.strip().isdigit()}
+        extra_hosts = {v.strip().lower() for v in get_setting("EXTRA_ALLOWED_DOWNLOAD_HOSTS").split(",") if v.strip()}
         self.allowed_hosts = ALLOWED_HOSTS | extra_hosts
-        self.force_join_channels = parse_force_join_channels(os.getenv("FORCE_JOIN_CHANNELS", ""))
+        self.force_join_channels = parse_force_join_channels(get_setting("FORCE_JOIN_CHANNELS"))
         self.result_root.mkdir(parents=True, exist_ok=True)
 
 
@@ -571,166 +589,11 @@ def make_package_zip(package_root: Path, artifact_root: Path, report: dict[str, 
     return archive
 
 
-class StatsDB:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock = asyncio.Lock()
-        with sqlite3.connect(self.path) as conn:
-            conn.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT,
-                language_code TEXT, phone TEXT, country_code TEXT, points INTEGER NOT NULL DEFAULT 0,
-                banned INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_active INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS points_ledger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, delta INTEGER NOT NULL,
-                reason TEXT NOT NULL, related_user_id INTEGER, created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS referrals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER NOT NULL, referred_id INTEGER UNIQUE NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, rewarded_at INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS scans (
-                scan_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, raw_url TEXT NOT NULL, extension_name TEXT,
-                version TEXT, canonical_url TEXT, final_url TEXT, archive_sha256 TEXT, source_path TEXT,
-                report_path TEXT, ioc_path TEXT, secrets_path TEXT, status TEXT NOT NULL, created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS admin_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, action TEXT NOT NULL,
-                target_id INTEGER, reason TEXT, created_at INTEGER NOT NULL
-            );
-            """)
-            conn.commit()
-
-    async def upsert_user(self, tg_user: Any, referral_id: int | None = None) -> tuple[bool, bool]:
-        now = int(time.time())
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                exists = conn.execute("SELECT 1 FROM users WHERE user_id=?", (tg_user.id,)).fetchone() is not None
-                conn.execute("INSERT INTO users(user_id,username,first_name,last_name,language_code,created_at,last_active) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,first_name=excluded.first_name,last_name=excluded.last_name,language_code=excluded.language_code,last_active=excluded.last_active", (tg_user.id, tg_user.username, tg_user.first_name or "", tg_user.last_name or "", tg_user.language_code, now, now))
-                referral_created = False
-                if not exists and referral_id and referral_id != tg_user.id and conn.execute("SELECT 1 FROM users WHERE user_id=?", (referral_id,)).fetchone():
-                    conn.execute("INSERT OR IGNORE INTO referrals(referrer_id,referred_id,status,created_at) VALUES(?,?,?,?)", (referral_id, tg_user.id, "pending", now))
-                    referral_created = True
-                conn.commit()
-                return exists, referral_created
-
-    async def set_contact(self, user_id: int, phone: str) -> None:
-        country = re.sub(r"\D", "", phone)[:3] or None
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.execute("UPDATE users SET phone=?, country_code=?, last_active=? WHERE user_id=?", (phone, country, int(time.time()), user_id))
-                conn.commit()
-
-    async def delete_contact(self, user_id: int) -> None:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.execute("UPDATE users SET phone=NULL,country_code=NULL,last_active=? WHERE user_id=?", (int(time.time()), user_id))
-                conn.commit()
-
-    async def get_user(self, user_id: int) -> dict[str, Any] | None:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-                return dict(row) if row else None
-
-    async def get_points(self, user_id: int) -> int:
-        user = await self.get_user(user_id)
-        return int(user["points"]) if user else 0
-
-    async def add_points(self, user_id: int, delta: int, reason: str, related_user_id: int | None = None) -> int:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                row = conn.execute("SELECT points FROM users WHERE user_id=?", (user_id,)).fetchone()
-                if not row:
-                    raise BotError("User is not registered.")
-                new_points = max(0, int(row[0]) + delta)
-                actual_delta = new_points - int(row[0])
-                conn.execute("UPDATE users SET points=?,last_active=? WHERE user_id=?", (new_points, int(time.time()), user_id))
-                if actual_delta:
-                    conn.execute("INSERT INTO points_ledger(user_id,delta,reason,related_user_id,created_at) VALUES(?,?,?,?,?)", (user_id, actual_delta, reason, related_user_id, int(time.time())))
-                conn.commit()
-                return new_points
-
-    async def spend_point(self, user_id: int, reason: str) -> int:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                row = conn.execute("SELECT points FROM users WHERE user_id=? AND banned=0", (user_id,)).fetchone()
-                if not row or int(row[0]) < 1:
-                    raise BotError("You need at least 1 point to run this scan.")
-                new_points = int(row[0]) - 1
-                conn.execute("UPDATE users SET points=?,last_active=? WHERE user_id=?", (new_points, int(time.time()), user_id))
-                conn.execute("INSERT INTO points_ledger(user_id,delta,reason,created_at) VALUES(?,?,?,?)", (user_id, -1, reason, int(time.time())))
-                conn.commit()
-                return new_points
-
-    async def complete_referral(self, referred_id: int) -> tuple[int, bool]:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                row = conn.execute("SELECT referrer_id FROM referrals WHERE referred_id=? AND status='pending'", (referred_id,)).fetchone()
-                if not row:
-                    return 0, False
-                referrer_id = int(row[0])
-                now = int(time.time())
-                conn.execute("UPDATE referrals SET status='rewarded',rewarded_at=? WHERE referred_id=?", (now, referred_id))
-                for user_id, related in ((referred_id, referrer_id), (referrer_id, referred_id)):
-                    conn.execute("UPDATE users SET points=points+1,last_active=? WHERE user_id=?", (now, user_id))
-                    conn.execute("INSERT INTO points_ledger(user_id,delta,reason,related_user_id,created_at) VALUES(?,?,?,?,?)", (user_id, 1, "verified referral reward", related, now))
-                conn.commit()
-                return referrer_id, True
-
-    async def record_scan(self, scan_id: str, user_id: int, raw_url: str, report: dict[str, Any], result: JobResult, status: str = "ok") -> None:
-        manifest = report.get("manifest") or {}
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.execute("INSERT OR REPLACE INTO scans(scan_id,user_id,raw_url,extension_name,version,canonical_url,final_url,archive_sha256,source_path,report_path,ioc_path,secrets_path,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (scan_id, user_id, raw_url[:2000], str(report.get("extension_name", report.get("suggested_name", "unknown"))), str(manifest.get("version", "unknown")), report.get("canonical_url"), report.get("final_url"), report.get("archive", {}).get("sha256"), str(result.source_zip), str(result.report_path), str(result.ioc_path), str(result.secrets_path), status, int(time.time())))
-                conn.commit()
-
-    async def list_scans(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.row_factory = sqlite3.Row
-                return [dict(row) for row in conn.execute("SELECT * FROM scans WHERE user_id=? ORDER BY created_at DESC LIMIT ?", (user_id, limit)).fetchall()]
-
-    async def get_scan(self, scan_id: str) -> dict[str, Any] | None:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute("SELECT * FROM scans WHERE scan_id=?", (scan_id,)).fetchone()
-                return dict(row) if row else None
-
-    async def list_users(self, offset: int = 0, limit: int = 8) -> list[dict[str, Any]]:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.row_factory = sqlite3.Row
-                return [dict(row) for row in conn.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()]
-
-    async def referral_rows(self, user_id: int) -> list[dict[str, Any]]:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute("SELECT r.*,u.username,u.first_name,u.last_name FROM referrals r LEFT JOIN users u ON u.user_id=r.referred_id WHERE r.referrer_id=? ORDER BY r.created_at DESC", (user_id,)).fetchall()
-                return [dict(row) for row in rows]
-
-    async def stats(self) -> dict[str, int]:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                values = conn.execute("SELECT (SELECT COUNT(*) FROM users),(SELECT COALESCE(SUM(points),0) FROM users),(SELECT COUNT(*) FROM scans),(SELECT COUNT(*) FROM scans WHERE status='ok'),(SELECT COUNT(*) FROM referrals WHERE status='rewarded')").fetchone()
-                return {"users": int(values[0]), "points": int(values[1]), "scans": int(values[2]), "successful": int(values[3]), "referrals": int(values[4])}
-
-    async def audit(self, admin_id: int, action: str, target_id: int | None = None, reason: str = "") -> None:
-        async with self.lock:
-            with sqlite3.connect(self.path) as conn:
-                conn.execute("INSERT INTO admin_audit(admin_id,action,target_id,reason,created_at) VALUES(?,?,?,?,?)", (admin_id, action, target_id, reason[:1000], int(time.time())))
-                conn.commit()
-
 
 class BotService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.db = StatsDB(settings.db_path)
+        self.db = StatsDB()
         self.semaphore = asyncio.Semaphore(settings.parallel_jobs)
         self.user_windows: dict[int, deque[float]] = defaultdict(deque)
 
@@ -1016,7 +879,7 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_url: s
         await update.effective_message.reply_text(secrets_preview_message(result.report), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▣ Download Secrets Report", callback_data=f"scan:secrets:{result.scan_id}")]]))
         with result.source_zip.open("rb") as source_file:
             await update.effective_message.reply_document(InputFile(source_file, filename=result.source_zip.name), caption=f"{BRAND}\nFetched By {WATERMARK}\nBeautified source, original files, reports, and watermark included.")
-    except BotError as exc:
+    except (BotError, ValueError) as exc:
         await update.effective_message.reply_text(f"{premium_header('SCAN FAILED')}\n\n{html.escape(str(exc))}{premium_footer()}", parse_mode="HTML")
     except Exception:
         LOG.exception("Unhandled scan failure")
