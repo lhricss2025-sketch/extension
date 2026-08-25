@@ -40,7 +40,7 @@ from telegram.ext import (
 
 LOG = logging.getLogger("senzo_extension_bot")
 
-BUILD_VERSION = "senzo-audited-turso-2026-08-25"
+BUILD_VERSION = "senzo-points-audited-2026-08-25"
 BRAND = "SENZO EXTENSION INSPECTOR"
 WATERMARK = "@Senzo268"
 BOT_USERNAME = "@SenzoExtension_Bot"
@@ -48,6 +48,7 @@ BOT_USERNAME = "@SenzoExtension_Bot"
 # Railway Variables override every non-secret default below.
 EMBEDDED_CONFIG = {
     "ADMIN_USER_IDS": "",
+    "CHARGE_ADMIN_SCANS": "1",
 
     "RESULT_ROOT": "./data/results",
     "FORCE_JOIN_CHANNELS": "",  # Set: -1001234567890|https://t.me/+invite for a private Telegram channel.
@@ -290,6 +291,27 @@ class StatsDB:
             )
             self._commit()
 
+    async def finalize_scan(self, scan_id: str, user_id: int, raw_url: str, report: dict[str, Any], result: Any, charge_point: bool = True) -> int:
+        manifest = report.get("manifest") or {}
+        async with self.lock:
+            now = int(time.time())
+            remaining_row = self._one("SELECT points FROM users WHERE user_id=? AND banned=0", (user_id,))
+            if not remaining_row:
+                raise ValueError("User is not registered or is blocked.")
+            remaining = int(remaining_row["points"])
+            if charge_point:
+                cursor = self._execute("UPDATE users SET points=points-1,last_active=? WHERE user_id=? AND banned=0 AND points>=1", (now, user_id))
+                if getattr(cursor, "rowcount", 0) != 1:
+                    raise ValueError("You need at least 1 point to complete this scan.")
+                self._execute("INSERT INTO points_ledger(user_id,delta,reason,created_at) VALUES(?,?,?,?)", (user_id, -1, f"successful extension scan:{scan_id}", now))
+                remaining -= 1
+            self._execute(
+                "INSERT OR REPLACE INTO scans(scan_id,user_id,raw_url,extension_name,version,canonical_url,final_url,archive_sha256,source_path,report_path,ioc_path,secrets_path,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (scan_id, user_id, raw_url[:2000], str(report.get("extension_name", report.get("suggested_name", "unknown"))), str(manifest.get("version", "unknown")), report.get("canonical_url"), report.get("final_url"), report.get("archive", {}).get("sha256"), str(result.source_zip), str(result.report_path), str(result.ioc_path), str(result.secrets_path), "ok", now),
+            )
+            self._commit()
+            return remaining
+
     async def list_scans(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
         async with self.lock:
             return self._many("SELECT * FROM scans WHERE user_id=? ORDER BY created_at DESC LIMIT ?", (user_id, limit))
@@ -388,6 +410,7 @@ class Settings:
         self.parallel_jobs = int(get_setting("PARALLEL_JOBS"))
         self.request_timeout = float(get_setting("REQUEST_TIMEOUT_SECONDS"))
         self.admin_ids = {int(v.strip()) for v in get_setting("ADMIN_USER_IDS").split(",") if v.strip().isdigit()}
+        self.charge_admin_scans = get_setting("CHARGE_ADMIN_SCANS").strip().lower() in {"1", "true", "yes", "on"}
         extra_hosts = {v.strip().lower() for v in get_setting("EXTRA_ALLOWED_DOWNLOAD_HOSTS").split(",") if v.strip()}
         self.allowed_hosts = ALLOWED_HOSTS | extra_hosts
         self.force_join_channels = parse_force_join_channels(get_setting("FORCE_JOIN_CHANNELS"))
@@ -994,14 +1017,15 @@ def secrets_preview_message(report: dict[str, Any]) -> str:
 
 def compact_summary(report: dict[str, Any], points_left: int) -> str:
     manifest = report.get("manifest") or {}
-    risk = report["risk"]
+    package = report.get("package") or {}
+    risk = report.get("risk") or {"level": "unknown", "score": 0}
     return (f"{premium_header('SCAN COMPLETE')}\n\n"
-            f"<b>Extension:</b> <code>{html.escape(str(report.get('extension_name', report.get('suggested_name', 'unknown'))))}</code>\n"
+            f"<b>Extension:</b> <code>{html.escape(str(report.get('extension_name', 'unknown')))}</code>\n"
             f"<b>Version:</b> <code>{html.escape(str(manifest.get('version', 'unknown')))}</code>\n"
-            f"<b>Files:</b> <code>{report['package']['file_count']}</code>\n"
-            f"<b>Risk:</b> <b>{risk['level'].upper()}</b> <code>{risk['score']}</code>\n"
-            f"<b>IOC items:</b> <code>{sum(report['ioc_summary'].values())}</code>\n"
-            f"<b>Possible secrets:</b> <code>{report['secrets_count']}</code>\n"
+            f"<b>Files:</b> <code>{package.get('file_count', report.get('file_count', 0))}</code>\n"
+            f"<b>Archive:</b> <code>{int(package.get('archive_size', report.get('archive_size', 0))):,} bytes</code>\n"
+            f"<b>Risk:</b> <code>{html.escape(str(risk.get('level', 'unknown')).upper())} · {int(risk.get('score', 0))}/10</code>\n"
+            f"<b>Possible secrets:</b> <code>{int(report.get('secrets_count', 0))}</code>\n"
             f"<b>Points remaining:</b> <code>{points_left}</code>\n"
             f"{premium_footer()}")
 
@@ -1141,15 +1165,16 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_url: s
     if not user or user["banned"]:
         await update.effective_message.reply_text("Your access is currently unavailable.")
         return
-    if user["points"] < 1 and user_id not in service.settings.admin_ids:
+    is_admin = user_id in service.settings.admin_ids
+    charge_scan = (not is_admin) or service.settings.charge_admin_scans
+    if user["points"] < 1 and charge_scan:
         await update.effective_message.reply_text(f"{premium_header('NOT ENOUGH POINTS')}\n\n➜ You need 1 point for a scan.\n➜ Invite a new user with /referral to earn verified referral points.{premium_footer()}", parse_mode="HTML", reply_markup=main_menu())
         return
     try:
         service.check_rate_limit(user_id)
         await update.effective_message.reply_text(f"{premium_header('SENZO SCANNING')}\n\n✓ URL validated\n➜ Downloading package...{premium_footer()}", parse_mode="HTML")
         result = await service.process(raw_url)
-        points_left = user["points"] if user_id in service.settings.admin_ids else await service.db.spend_point(user_id, f"successful extension scan:{result.scan_id}")
-        await service.db.record_scan(result.scan_id, user_id, raw_url, result.report, result)
+        points_left = await service.db.finalize_scan(result.scan_id, user_id, raw_url, result.report, result, charge_point=charge_scan)
         await update.effective_message.reply_text(compact_summary(result.report, points_left), parse_mode="HTML", reply_markup=result_keyboard(result.scan_id))
         await update.effective_message.reply_text(ioc_preview_message(result.report), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▣ Download IOC Report", callback_data=f"scan:ioc:{result.scan_id}")]]))
         await update.effective_message.reply_text(secrets_preview_message(result.report), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▣ Download Secrets Report", callback_data=f"scan:secrets:{result.scan_id}")]]))
